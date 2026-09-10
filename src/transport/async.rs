@@ -407,9 +407,11 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                                             break;
                                         }
 
-                                        info!("Successfully reconnected to TWS/Gateway");
-                                        message_bus.connected.store(true, Ordering::Relaxed);
                                         message_bus.reset_channels().await;
+                                        if !message_bus.shutdown.is_requested() {
+                                            message_bus.connected.store(true, Ordering::Relaxed);
+                                            info!("Successfully reconnected to TWS/Gateway");
+                                        }
                                     }
                                     // Shutdown was requested while reconnecting:
                                     // not a failure, and the flag is already
@@ -474,26 +476,33 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     async fn reset_channels(&self) {
         debug!("resetting message bus channels");
 
-        for sender in self.request_channels.read().await.values() {
-            let _ = sender.send(Error::ConnectionReset.into());
-        }
-        for sender in self.order_channels.read().await.values() {
-            let _ = sender.send(Error::ConnectionReset.into());
-        }
+        reset_id_channels(&self.request_channels).await;
+        reset_id_channels(&self.order_channels).await;
+        self.reset_shared_channels().await;
+        self.execution_channels.write().await.clear();
+    }
+
+    async fn reset_shared_channels(&self) {
+        // Resubscription takes this map's read lock to choose its channel tail.
+        // Keep it out until all reset notifications have been published.
+        let _receivers = self.shared_channel_receivers.write().await;
+        let senders = self.shared_channel_senders.read().await;
+        let mut notified: Vec<&BroadcastSender> = Vec::new();
+
         // Shared channels too, mirroring sync's `notify_all`: an in-flight
         // open_orders/positions subscription awaits an end marker only the
         // pre-reconnect request could produce, so it would hang forever.
         // Unfiltered on purpose — `fail_one_shot_channels`' one-shot filter
         // protects live streams from *unrelated* errors, but a reset
         // terminates every stream by definition. The senders are not cleared
-        // here, unlike the maps below.
-        for sender in self.shared_channel_senders.read().await.values().flatten() {
-            let _ = sender.send(Error::ConnectionReset.into());
+        // here, unlike request/order registrations.
+        for sender in senders.values().flatten() {
+            // Multiple response kinds can name the same broadcast channel.
+            if !notified.iter().any(|previous| previous.same_channel(sender)) {
+                let _ = sender.send(Error::ConnectionReset.into());
+                notified.push(sender);
+            }
         }
-
-        self.request_channels.write().await.clear();
-        self.order_channels.write().await.clear();
-        self.execution_channels.write().await.clear();
     }
 
     /// Notify all waiting subscriptions about shutdown
@@ -766,6 +775,16 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     }
 }
 
+/// Remove only the old registrations before a reset wakes their subscribers.
+/// A subscriber can immediately register a retry; clearing the live map after
+/// notification would silently delete that new registration.
+async fn reset_id_channels(channels: &RwLock<HashMap<i32, BroadcastSender>>) {
+    let old_channels = std::mem::take(&mut *channels.write().await);
+    for sender in old_channels.into_values() {
+        let _ = sender.send(Error::ConnectionReset.into());
+    }
+}
+
 #[async_trait]
 impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     async fn send_request(&self, request_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
@@ -923,3 +942,7 @@ pub(crate) mod test_listener;
 #[cfg(test)]
 #[path = "async_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "async_reset_tests.rs"]
+mod reset_tests;

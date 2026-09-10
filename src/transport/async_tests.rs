@@ -39,7 +39,7 @@ fn body(text: &str) -> Vec<u8> {
 /// Wrap a fresh `MemoryStream` in a stubbed `AsyncTcpMessageBus`. Pins
 /// `server_version` to the current floor so `parse_raw_message` produces
 /// binary-text-payload frames from `body()` inputs.
-fn make_bus() -> (MemoryStream, Arc<AsyncTcpMessageBus<MemoryStream>>) {
+pub(super) fn make_bus() -> (MemoryStream, Arc<AsyncTcpMessageBus<MemoryStream>>) {
     let stream = MemoryStream::default();
     let connection = AsyncConnection::stubbed(stream.clone(), 28);
     connection.set_server_version_for_test(server_versions::PROTOBUF_REST_MESSAGES_3);
@@ -1079,8 +1079,8 @@ async fn test_drop_then_recreate_order_update_stream() {
 }
 
 /// `reset_channels` after reconnect: every in-flight request and order
-/// subscription receives `Error::ConnectionReset`, then the channel maps are
-/// cleared.
+/// subscription receives `Error::ConnectionReset`; only old request/order
+/// registrations are removed before notifying them.
 #[tokio::test]
 async fn test_reset_channels_notifies_in_flight_subscriptions() {
     let (_, bus) = make_bus();

@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Async reconnect no longer clears a request or order subscription registered in response to a reset notification. Shared-channel resubscription is serialized with its reset notifications, and each shared channel receives one reset regardless of how many message kinds feed it. The client reports connected only after reset handling completes, unless shutdown was requested.
+
 - Symbol search returns `Error::UnexpectedEndOfStream` if the response stream closes before a symbol-samples frame arrives, instead of reporting a successful empty search. A received frame containing zero matches still returns an empty vector.
 
 - Preserve available market-data ticks after partial API-entitlement advisory 10091, including delayed option computations. Both clients deliver it as a nonterminal notice instead of ending the subscription.
