@@ -795,13 +795,11 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             channels.insert(request_id, sender);
         }
 
+        // Own the registration before an error or caller drop can leave the
+        // awaited write. Drop performs local cleanup, not a wire cancellation.
+        let subscription = AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone(), CleanupSignal::Request(request_id));
         self.connection.write_message(&message).await?;
-
-        Ok(AsyncInternalSubscription::with_cleanup(
-            receiver,
-            self.cleanup_sender.clone(),
-            CleanupSignal::Request(request_id),
-        ))
+        Ok(subscription)
     }
 
     async fn send_order_request(&self, order_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
@@ -812,13 +810,9 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             channels.insert(order_id, sender);
         }
 
+        let subscription = AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone(), CleanupSignal::Order(order_id));
         self.connection.write_message(&message).await?;
-
-        Ok(AsyncInternalSubscription::with_cleanup(
-            receiver,
-            self.cleanup_sender.clone(),
-            CleanupSignal::Order(order_id),
-        ))
+        Ok(subscription)
     }
 
     async fn send_shared_request(&self, message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
@@ -946,3 +940,7 @@ mod tests;
 #[cfg(test)]
 #[path = "async_reset_tests.rs"]
 mod reset_tests;
+
+#[cfg(test)]
+#[path = "async_submission_tests.rs"]
+mod submission_tests;
