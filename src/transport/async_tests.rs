@@ -980,19 +980,21 @@ async fn test_warning_with_orphan_request_id_logs() {
 /// until the cleanup task has processed it. Signals are processed FIFO by a
 /// single task, so once the marker's registration is gone, every signal sent
 /// before it has been handled too.
-async fn drain_cleanup_signals(bus: &Arc<AsyncTcpMessageBus<MemoryStream>>) {
+pub(super) async fn drain_cleanup_signals<S: AsyncStream>(bus: &Arc<AsyncTcpMessageBus<S>>) {
     const MARKER_REQUEST_ID: i32 = 987_654;
     let marker = bus.send_request(MARKER_REQUEST_ID, vec![]).await.unwrap();
     drop(marker);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if !bus.request_channels.read().await.contains_key(&MARKER_REQUEST_ID) {
-            return;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !bus.request_channels.read().await.contains_key(&MARKER_REQUEST_ID) {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    panic!("cleanup task did not process the marker signal");
+    })
+    .await
+    .expect("cleanup task did not process the marker signal");
 }
 
 /// Regression test for #773: dropping an old order subscription must not

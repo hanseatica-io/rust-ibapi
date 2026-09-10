@@ -643,8 +643,8 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
 
         self.requests.insert(request_id, sender);
 
-        self.connection.write_message(message)?;
-
+        // Own the registration before a write error can leave this method.
+        // Drop performs local cleanup, not a wire cancellation.
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender_copy)
@@ -652,6 +652,7 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
             .request_id(request_id)
             .build();
 
+        self.connection.write_message(message)?;
         Ok(subscription)
     }
 
@@ -674,8 +675,6 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
         self.orders.insert(order_id, sender);
         debug!("Registered order subscription for order_id={}", order_id);
 
-        self.connection.write_message(message)?;
-
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender_copy)
@@ -683,6 +682,7 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
             .order_id(order_id)
             .build();
 
+        self.connection.write_message(message)?;
         Ok(subscription)
     }
 
@@ -993,3 +993,7 @@ pub(crate) mod test_listener;
 #[cfg(test)]
 #[path = "sync_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sync_submission_tests.rs"]
+mod submission_tests;

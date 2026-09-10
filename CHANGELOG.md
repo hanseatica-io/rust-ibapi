@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Request and order registrations are now owned before submission writes begin, so write failures (both clients) and caller cancellation during an async write trigger local registration cleanup. Successful submissions transfer ownership to the returned subscription; stale cleanup still preserves a newer registration. This does not send a broker cancellation or make an interrupted wire write safe to reuse.
+
 - Async reconnect no longer clears a request or order subscription registered in response to a reset notification. Shared-channel resubscription is serialized with its reset notifications, and each shared channel receives one reset regardless of how many message kinds feed it. The client reports connected only after reset handling completes, unless shutdown was requested.
 
 - Symbol search returns `Error::UnexpectedEndOfStream` if the response stream closes before a symbol-samples frame arrives, instead of reporting a successful empty search. A received frame containing zero matches still returns an empty vector.
