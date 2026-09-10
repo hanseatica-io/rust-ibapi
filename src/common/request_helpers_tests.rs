@@ -28,7 +28,7 @@ fn test_fold_one_shot_reads_a_closed_stream_as_an_error() {
 
 #[test]
 fn test_empty_on_end_of_stream_converts_only_that_variant() {
-    // The ten collection sites read a closed stream as "nothing to report"...
+    // Callers opting in read a closed stream as "nothing to report"...
     let recovered: Result<Vec<i32>, Error> = empty_on_end_of_stream(Error::UnexpectedEndOfStream);
     assert_eq!(recovered.expect("end of stream becomes the empty collection"), Vec::<i32>::new());
 

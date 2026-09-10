@@ -1,7 +1,7 @@
 use super::common::{decoders, encoders, verify};
 use super::*;
 use crate::client::blocking::{ClientRequestBuilders, Subscription};
-use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
+use crate::common::request_helpers::{self, expect_proto};
 use crate::messages::{IncomingMessages, OutgoingMessages};
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::StreamDecoder;
@@ -153,6 +153,11 @@ impl Client {
 
     /// Requests matching stock symbols.
     ///
+    /// Retries a connection reset up to three times after the first attempt.
+    /// Use [`Self::matching_symbols_once`] to own retry pacing and admission.
+    /// An empty vector requires a symbol-samples response with no matches;
+    /// a closed response stream is [`Error::UnexpectedEndOfStream`].
+    ///
     /// # Arguments
     /// * `pattern` - Either start of ticker symbol or (for larger strings) company name.
     ///
@@ -176,7 +181,42 @@ impl Client {
             |request_id| encoders::encode_request_matching_symbols(request_id, pattern),
             expect_proto(decoders::decode_symbol_samples_proto),
         )
-        .or_else(empty_on_end_of_stream)
+    }
+
+    /// Requests matching stock symbols with at most one outbound attempt.
+    ///
+    /// Unlike [`Self::matching_symbols`], this never resends on
+    /// [`Error::ConnectionReset`]. Callers own admission, pacing and any retry.
+    /// It does not impose a timeout or cancel a request already written.
+    /// Only a received symbol-samples frame can produce an empty vector;
+    /// EOF before that frame is [`Error::UnexpectedEndOfStream`].
+    ///
+    /// # Arguments
+    /// * `pattern` - Either start of ticker symbol or (for larger strings) company name.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    ///
+    /// fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100)?;
+    ///     let symbols = client.matching_symbols_once("AAP")?;
+    ///     for symbol in symbols {
+    ///         println!("{} - {} ({})", symbol.contract.symbol,
+    ///                  symbol.contract.primary_exchange, symbol.contract.currency);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn matching_symbols_once(&self, pattern: &str) -> Result<Vec<ContractDescription>, Error> {
+        check_version(self.server_version, Features::REQ_MATCHING_SYMBOLS)?;
+
+        request_helpers::blocking::one_shot_by_request_id_once(
+            self,
+            |request_id| encoders::encode_request_matching_symbols(request_id, pattern),
+            expect_proto(decoders::decode_symbol_samples_proto),
+        )
     }
 
     /// Calculates an option's price based on the provided volatility and its underlying's price.

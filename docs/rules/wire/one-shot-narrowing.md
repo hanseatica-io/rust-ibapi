@@ -8,9 +8,9 @@ triggers:
   - passing a processor to one_shot_shared or one_shot_by_request_id
   - wondering whether a one-shot should retry
   - adding a decode_*_proto sibling for a one-shot response
-symbols: [expect_proto, ProtoPayload, one_shot_shared, one_shot_by_request_id, fold_one_shot, empty_on_end_of_stream, expect_type, retry_on_connection_reset]
+symbols: [expect_proto, ProtoPayload, one_shot_shared, one_shot_by_request_id, one_shot_by_request_id_once, matching_symbols_once, fold_one_shot, empty_on_end_of_stream, expect_type, retry_on_connection_reset]
 related: [proto-only-decoding, proto-aware-accessors, fixture-builders]
-precedents: ["#736", "#738", "#740", "#741", "#745", "#749"]
+precedents: ["#736", "#738", "#740", "#741", "#745", "#749", "Explicit single-attempt symbol search for caller-owned retry pacing"]
 memory: [project_protobuf_only, feedback_request_id_index_registration]
 ---
 
@@ -31,21 +31,26 @@ the frame. A one-shot API's decoder therefore takes the *decoded* `prost` type, 
 give the payload an `impl ProtoPayload` (`src/proto/payload.rs`) if it lacks one, which
 `expect_proto` will demand anyway since it cannot infer `MESSAGE_ID` otherwise.
 
-**There are two one-shot helpers, and both retry.** `one_shot_by_request_id` for a
+**Convenience one-shot APIs retry by default.** `one_shot_by_request_id` for a
 request-id request, `one_shot_shared` for a shared channel. Neither takes a
 `ProtocolFeature` — do the version check on the line above. Usually that is
 `check_version(server_version, Features::X)?`, but not always: `news` uses
 `check_server_version(..)` and `historical_data` uses `validate_historical_data(..)`, which is
-half of why a `feature` parameter cannot come back. 44 of the 54 one-shot sites check a version;
-the 10 that do not are `server_time`, `managed_accounts`, `request_fa`, `next_valid_order_id`,
+half of why a `feature` parameter cannot come back. Unversioned one-shot APIs include
+`server_time`, `managed_accounts`, `request_fa`, `next_valid_order_id`,
 and `scanner_parameters`, none of which carries a `MinServerVer` in the C# client.
 
 Neither helper takes an `on_none` either: a closed stream is `Error::UnexpectedEndOfStream`.
-The ten sites where "TWS sent nothing" is a legitimate empty answer chain
-`.or_else(empty_on_end_of_stream)`.
+Only APIs whose contract explicitly permits it chain `.or_else(empty_on_end_of_stream)`.
+Symbol search is not one: an empty symbol-samples frame is an answer, EOF is not.
 
-A one-shot that does not retry is a bug, not a choice. `fold_one_shot` is private to
-`request_helpers` so that hand-rolling one is not reachable from a domain module.
+An explicitly single-attempt public API may use `one_shot_by_request_id_once`, with
+the same `expect_proto` narrowing. Its name and documentation must state that the
+caller owns retries. `matching_symbols_once` is this escape hatch for callers
+that must admit and pace each actual request, including retries, on a shared
+connection. Keep convenience defaults unchanged; do not silently opt another
+API out of retries. Test both methods' resend counts and error propagation
+through the public API. `fold_one_shot` stays private.
 
 Do not reach for `expect_proto` inside `impl StreamDecoder::decode`; see
 [proto-only decoding](proto-only-decoding.md) for what that surface owes instead.
@@ -77,17 +82,20 @@ FamilyCodes, got .. kind: UserInfo` rather than decoding one message's bytes int
 and asserting on the result.
 
 `expect_proto` is a combinator returning `impl Fn(&ResponseMessage)` rather than another
-parameter on the two one-shot helpers, which take three and four arguments against a budget of
+parameter on the convenience one-shot helpers, which take three and four arguments against a budget of
 three (see [param budget](../style/param-budget.md)) with no builder in front of them.
 
-## Why every one-shot retries
+## Why convenience one-shots retry, and when the caller must own it
 
-`retry_on_connection_reset` fires only on `Error::ConnectionReset` and gives up after three
-attempts. Every one-shot here is a read — encode, send, read one frame — so replaying it after
-the gateway drops the connection costs nothing and loses no server-side state. There is no
-one-shot for which the answer differs, which is why the helper no longer offers the choice.
+`retry_on_connection_reset` fires only on `Error::ConnectionReset` and permits three
+retries after the initial attempt. Read-only does not mean that retries consume no
+resources: every resend is another outbound message and request. A caller sharing
+the socket with account traffic may need to pace and budget each one. An invisible
+retry loop cannot honour that caller's admission boundary. The explicit single-attempt
+entry point returns the reset unchanged so the caller can re-admit before retrying.
+It is not a timeout, cancellation, memory-bound or transport-reset-ordering guarantee.
 
-It used to. A third helper, `one_shot_request`, was the only one taking a `ProtocolFeature`, so
+Before #741, a third helper, `one_shot_request`, was the only one taking a `ProtocolFeature`, so
 the four version-gated shared-channel one-shots (`market_rule`, `family_codes`, sync and async)
 picked it and silently gave up retry — while `market_depth_exchanges`, equally version-gated,
 called `check_version` inline and kept it. **The distinction was never about retry.** #741
@@ -120,3 +128,8 @@ axis they are not choosing gets chosen for them.
   so one type would have needed three `MESSAGE_ID`s. Keying on the `prost` payload has no
   collisions — a counter-example worth keeping, since the version that fails is the one that
   reads more natural.
+- Single-attempt symbol search — the retry default remains, but an explicit caller-owned
+  policy is no longer treated as a wiring mistake. Sync/async public tests capture each
+  request, require fresh ids, distinguish EOF from an empty symbol-samples frame, and
+  verify that the convenience method retains its retry limit. The transport reconnect
+  registration race is a separate gate; stub tests do not prove it fixed.

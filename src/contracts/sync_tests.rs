@@ -13,6 +13,119 @@ use crate::testdata::builders::contracts::{
 use std::sync::Arc;
 
 #[test]
+fn matching_symbols_once_decodes_real_responses_including_empty() {
+    for test_case in matching_symbols_test_cases() {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses));
+        let client = Client::stubbed(message_bus.clone(), server_versions::REQ_MATCHING_SYMBOLS);
+        let symbols = client.matching_symbols_once(test_case.pattern).expect(test_case.name);
+
+        assert_eq!(symbols.len(), test_case.expected_count, "{}", test_case.name);
+        assert_eq!(request_message_count(&message_bus), 1);
+        assert_request(
+            &message_bus,
+            0,
+            &matching_symbols_request().request_id(TEST_REQ_ID_FIRST).pattern(test_case.pattern),
+        );
+    }
+}
+
+#[test]
+fn matching_symbols_once_leaves_resets_and_retries_to_the_caller() {
+    let test_case = matching_symbols_test_cases().into_iter().find(|case| case.expected_count == 1).unwrap();
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses).with_connection_resets(1));
+    let client = Client::stubbed(message_bus.clone(), server_versions::REQ_MATCHING_SYMBOLS);
+
+    let result = client.matching_symbols_once(test_case.pattern);
+    assert!(matches!(result, Err(Error::ConnectionReset)), "got {result:?}");
+    assert_eq!(request_message_count(&message_bus), 1, "no hidden resend");
+
+    let symbols = client.matching_symbols_once(test_case.pattern).expect("explicit retry");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(request_message_count(&message_bus), 2);
+    for attempt in 0..2 {
+        assert_request(
+            &message_bus,
+            attempt,
+            &matching_symbols_request()
+                .request_id(TEST_REQ_ID_FIRST + attempt as i32)
+                .pattern(test_case.pattern),
+        );
+    }
+}
+
+#[test]
+fn matching_symbols_preserves_default_retry_limit_and_reencodes_each_attempt() {
+    use crate::common::retry::DEFAULT_MAX_RETRIES;
+
+    for resets in 1..=DEFAULT_MAX_RETRIES as usize + 1 {
+        let test_case = matching_symbols_test_cases().into_iter().find(|case| case.expected_count == 1).unwrap();
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses).with_connection_resets(resets));
+        let client = Client::stubbed(message_bus.clone(), server_versions::REQ_MATCHING_SYMBOLS);
+        let result = client.matching_symbols(test_case.pattern);
+        if resets <= DEFAULT_MAX_RETRIES as usize {
+            assert_eq!(result.expect("retry budget available").len(), 1);
+        } else {
+            assert!(matches!(result, Err(Error::ConnectionReset)), "got {result:?}");
+        }
+        let attempts = (resets + 1).min(DEFAULT_MAX_RETRIES as usize + 1);
+        assert_eq!(request_message_count(&message_bus), attempts);
+        for attempt in 0..attempts {
+            assert_request(
+                &message_bus,
+                attempt,
+                &matching_symbols_request()
+                    .request_id(TEST_REQ_ID_FIRST + attempt as i32)
+                    .pattern(test_case.pattern),
+            );
+        }
+    }
+}
+
+#[test]
+fn matching_symbols_preserves_definition_errors_without_retry() {
+    for once in [false, true] {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_error_response(
+            TEST_REQ_ID_FIRST,
+            200,
+            "No security definition has been found",
+        )]));
+        let client = Client::stubbed(message_bus.clone(), server_versions::REQ_MATCHING_SYMBOLS);
+        let result = if once {
+            client.matching_symbols_once("UNKNOWN")
+        } else {
+            client.matching_symbols("UNKNOWN")
+        };
+        assert_tws_error_message(result.expect_err("definition unresolved"), 200, "No security definition has been found");
+        assert_eq!(request_message_count(&message_bus), 1);
+    }
+}
+
+#[test]
+fn matching_symbols_once_rejects_unexpected_message() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![text_response("10|9000|")]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::REQ_MATCHING_SYMBOLS);
+
+    let result = client.matching_symbols_once("AAPL");
+    assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "got {result:?}");
+    assert_eq!(request_message_count(&message_bus), 1);
+}
+
+#[test]
+fn matching_symbols_both_entry_points_reject_old_server_before_sending() {
+    for once in [false, true] {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
+        let client = Client::stubbed(message_bus.clone(), server_versions::REQ_MATCHING_SYMBOLS - 1);
+        let result = if once {
+            client.matching_symbols_once("AAPL")
+        } else {
+            client.matching_symbols("AAPL")
+        };
+        assert!(matches!(result, Err(Error::ServerVersion(..))), "got {result:?}");
+        assert_eq!(request_message_count(&message_bus), 0);
+    }
+}
+
+#[test]
 fn test_contract_details() {
     for test_case in contract_details_test_cases() {
         let message_bus = Arc::new(MessageBusStub::with_ordered_responses(test_case.ordered_responses.clone()));
@@ -450,12 +563,18 @@ fn test_matching_symbols_rejects_unexpected_message() {
 }
 
 #[test]
-fn test_matching_symbols_returns_empty_on_closed_stream() {
-    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
-    let client = Client::stubbed(message_bus, server_versions::BOND_ISSUERID);
-
-    let symbols = client.matching_symbols("AAPL").expect("ok on empty stream");
-    assert!(symbols.is_empty());
+fn test_matching_symbols_returns_eof_on_closed_stream() {
+    for once in [false, true] {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]));
+        let client = Client::stubbed(message_bus.clone(), server_versions::BOND_ISSUERID);
+        let result = if once {
+            client.matching_symbols_once("AAPL")
+        } else {
+            client.matching_symbols("AAPL")
+        };
+        assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
+        assert_eq!(request_message_count(&message_bus), 1, "EOF must not trigger a retry");
+    }
 }
 
 #[test]

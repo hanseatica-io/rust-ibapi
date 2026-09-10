@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Client::matching_symbols_once` (sync and async) makes at most one outbound attempt, returning connection resets unchanged so callers can own retry pacing and admission. The existing `matching_symbols` convenience method retains three reset retries after its initial attempt.
+
 ### Changed
 
 - `DATA_ADVISORY_CODES` includes 10091 and widens from `[i32; 4]` to `[i32; 5]`. Code explicitly binding the previous array type must change; see `docs/migration-4.0.md` §6.
 
 ### Fixed
+
+- Symbol search returns `Error::UnexpectedEndOfStream` if the response stream closes before a symbol-samples frame arrives, instead of reporting a successful empty search. A received frame containing zero matches still returns an empty vector.
 
 - Preserve available market-data ticks after partial API-entitlement advisory 10091, including delayed option computations. Both clients deliver it as a nonterminal notice instead of ending the subscription.
 
