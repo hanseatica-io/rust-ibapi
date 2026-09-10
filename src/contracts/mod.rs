@@ -19,7 +19,9 @@ use crate::ToField;
 // Re-export V2 API types
 pub use builders::*;
 pub use common::contract_builder::ContractBuilder;
+pub use enumeration::{ContractQuery, QueryDisposition, QueryLimits};
 pub use option_chain_builder::OptionChainBuilder;
+pub mod enumeration;
 pub use types::*;
 
 // Common implementation modules

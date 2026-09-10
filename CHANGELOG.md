@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in `prepare_contract_details`, `prepare_matching_symbols`, and `option_chain(...).prepare(QueryLimits)` (both clients) expose an owned request ID before I/O. `ContractQuery` makes one attempt, preserves prefix data/notices on interruption, and bounds cumulative rows, raw queue frames/bytes and protobuf decode entries before domain allocation. Its lifecycle evidence distinguishes native completion, definition rejection and uncertain cleanup; local limits never become an empty success. Existing collecting/subscription APIs retain their behavior.
+
+- Owned queries retain registration through native contract-details cancellation (server 215+) and bounded terminal drain. A cancel write is not an acknowledgement. Missing completion, abandoned/failed writes and unfinished query drop request retirement of that client session, including other subscriptions sharing it, not unrelated Gateway clients. Async callers can impose one total timeout; blocking read deadlines do not bound blocking socket writes. See `docs/bounded-contract-queries.md` for the outcome/reuse contract.
+
 - `Client::matching_symbols_once` (sync and async) makes at most one outbound attempt, returning connection resets unchanged so callers can own retry pacing and admission. The existing `matching_symbols` convenience method retains three reset retries after its initial attempt.
 
 ### Changed
@@ -16,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DATA_ADVISORY_CODES` includes 10091 and widens from `[i32; 4]` to `[i32; 5]`. Code explicitly binding the previous array type must change; see `docs/migration-4.0.md` §6.
 
 ### Fixed
+
+- A bounded query's partial or abandoned async write latches shutdown before releasing the connection write turn. Later/queued writes and reconnect handshakes check shutdown inside that turn, so they cannot append to an uncertain frame. Successful writes leave the session usable; legacy write-failure retry policy is unchanged.
 
 - Request and order registrations are now owned before submission writes begin, so write failures (both clients) and caller cancellation during an async write trigger local registration cleanup. Successful submissions transfer ownership to the returned subscription; stale cleanup still preserves a newer registration. This does not send a broker cancellation or make an interrupted wire write safe to reuse.
 

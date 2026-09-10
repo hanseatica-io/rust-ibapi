@@ -3,6 +3,8 @@
 // Common utilities
 pub(crate) mod common;
 
+pub(crate) mod bounded;
+
 #[cfg(feature = "sync")]
 use std::sync::Arc;
 #[cfg(feature = "sync")]
@@ -34,6 +36,17 @@ pub(crate) type Response = Result<ResponseMessage, Error>;
 // MessageBus trait - defines the interface for message handling
 #[cfg(feature = "sync")]
 pub(crate) trait MessageBus: Send + Sync {
+    fn send_bounded(&self, _packet: &[u8]) -> Result<(), Error> {
+        Err(Error::NotImplemented)
+    }
+    fn register_bounded(&self, _request_id: i32, _spec: bounded::RequestSpec) -> Result<bounded::BoundedRead, Error> {
+        Err(Error::NotImplemented)
+    }
+
+    fn request_shutdown_sync(&self) {
+        self.ensure_shutdown();
+    }
+
     fn send_request(&self, request_id: i32, packet: &[u8]) -> Result<InternalSubscription, Error>;
 
     fn cancel_subscription(&self, request_id: i32, packet: &[u8]) -> Result<(), Error>;

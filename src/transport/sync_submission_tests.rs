@@ -42,6 +42,82 @@ impl Reconnect for SubmissionStream {
 
 impl Stream for SubmissionStream {}
 
+#[test]
+fn bounded_write_failure_retires_before_later_writes_or_handshake() {
+    let (stream, bus) = make_bus(true);
+    let packet = matching_symbols_request().request_id(42).pattern("AAP").encode_request();
+    assert!(matches!(bus.send_bounded(&packet), Err(Error::Io(_))));
+    stream.fail.store(false, Ordering::SeqCst);
+    assert!(matches!(bus.send_message(&packet), Err(Error::Shutdown)));
+    assert!(matches!(bus.connection.handshake(), Err(Error::Shutdown)));
+    assert_eq!(stream.attempts.lock().unwrap().len(), 1);
+    assert_eq!(stream.inner.captured(), encode_raw_length(&packet)[..2]);
+}
+
+#[test]
+fn bounded_success_does_not_retire_client() {
+    let (stream, bus) = make_bus(false);
+    let packet = matching_symbols_request().request_id(42).pattern("AAP").encode_request();
+    bus.send_bounded(&packet).unwrap();
+    assert!(!bus.shutdown.is_requested());
+    assert_eq!(stream.inner.captured(), encode_raw_length(&packet));
+}
+
+#[test]
+fn bounded_public_start_or_cancel_failure_retires_without_retry() {
+    use crate::contracts::{Contract, QueryDisposition, QueryLimits};
+    for cancel in [false, true] {
+        let (stream, bus) = make_bus(!cancel);
+        let bus = Arc::new(bus);
+        let client = crate::client::blocking::Client::stubbed(bus.clone(), crate::server_versions::CANCEL_CONTRACT_DATA);
+        let mut query = client
+            .prepare_contract_details(&Contract::stock("SYNTH").build(), QueryLimits::default())
+            .unwrap();
+        let id = query.request_id();
+        if cancel {
+            query.start().unwrap();
+            stream.fail.store(true, Ordering::SeqCst);
+            assert!(matches!(query.request_cancel(), Err(Error::Io(_))));
+        } else {
+            assert!(matches!(query.start(), Err(Error::Io(_))));
+        }
+        assert_eq!(query.disposition(), QueryDisposition::RetireRequired);
+        assert!(!bus.is_connected());
+        assert!(bus.bounded_requests.get(id).is_none());
+        assert_eq!(stream.attempts.lock().unwrap().len(), if cancel { 2 } else { 1 });
+        assert!(matches!(query.next_until(std::time::Instant::now()), Err(Error::Shutdown)));
+        assert!(matches!(query.request_cancel(), Err(Error::Shutdown)));
+        assert!(matches!(query.drain_until(std::time::Instant::now()), Err(Error::Shutdown)));
+    }
+}
+
+#[test]
+fn bounded_failed_cancel_keeps_buffered_prefix_readable_then_fuses() {
+    use crate::common::test_utils::helpers::binary_proto;
+    use crate::contracts::{Contract, QueryLimits};
+    use crate::subscriptions::SubscriptionItem;
+    use crate::testdata::builders::contracts::contract_data;
+    use crate::testdata::builders::ResponseProtoEncoder;
+    let (stream, bus) = make_bus(false);
+    let bus = Arc::new(bus);
+    let client = crate::client::blocking::Client::stubbed(bus.clone(), crate::server_versions::CANCEL_CONTRACT_DATA);
+    let mut query = client
+        .prepare_contract_details(&Contract::stock("SYNTH").build(), QueryLimits::default())
+        .unwrap();
+    query.start().unwrap();
+    stream.inner.push_inbound(binary_proto(
+        IncomingMessages::ContractData as i32,
+        &contract_data().request_id(query.request_id()).contract_id(123).to_proto(),
+    ));
+    bus.dispatch().unwrap();
+    stream.fail.store(true, Ordering::SeqCst);
+    assert!(matches!(query.request_cancel(), Err(Error::Io(_))));
+    assert!(!bus.is_connected());
+    assert!(matches!(query.next_until(std::time::Instant::now()).unwrap(), Some(SubscriptionItem::Data(row)) if row.contract.contract_id == 123));
+    assert!(matches!(query.next_until(std::time::Instant::now()), Err(Error::Shutdown)));
+    assert!(query.next_until(std::time::Instant::now()).unwrap().is_none());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Registration {
     Request,

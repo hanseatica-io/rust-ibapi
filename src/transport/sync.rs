@@ -190,6 +190,7 @@ pub struct TcpMessageBus<S: Stream> {
     connection: Connection<S>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     requests: SenderHash<i32, RoutedItem>,
+    bounded_requests: super::bounded::Registry,
     orders: SenderHash<i32, RoutedItem>,
     executions: SenderHash<String, RoutedItem>,
     shared_channels: SharedChannels,
@@ -213,6 +214,7 @@ impl<S: Stream> TcpMessageBus<S> {
             connection,
             handles: Mutex::new(Vec::default()),
             requests: SenderHash::new(),
+            bounded_requests: super::bounded::Registry::default(),
             orders: SenderHash::new(),
             executions: SenderHash::new(),
             shared_channels: SharedChannels::new(),
@@ -233,6 +235,7 @@ impl<S: Stream> TcpMessageBus<S> {
     fn request_shutdown(&self) {
         debug!("shutdown requested");
 
+        self.bounded_requests.close();
         self.requests.notify_all(|| Error::Shutdown.into());
         self.orders.notify_all(|| Error::Shutdown.into());
         self.shared_channels.notify_all(|| Error::Shutdown.into());
@@ -261,6 +264,7 @@ impl<S: Stream> TcpMessageBus<S> {
     fn reset(&self) {
         debug!("reset message bus");
 
+        self.bounded_requests.reset();
         self.requests.notify_all(|| Error::ConnectionReset.into());
         self.orders.notify_all(|| Error::ConnectionReset.into());
         self.shared_channels.notify_all(|| Error::ConnectionReset.into());
@@ -408,8 +412,9 @@ impl<S: Stream> TcpMessageBus<S> {
     /// Route an error frame by severity and request id. Mirrors the async
     /// transport's `route_error_message`.
     fn route_error_message(&self, payload: DecodedError) {
-        let sent_to_update_stream = order_update_notice(&payload, self.requests.contains(&payload.request_id))
-            .is_some_and(|notice| self.send_order_update_item(RoutedItem::Notice(notice)));
+        let data_owned = self.requests.contains(&payload.request_id) || self.bounded_requests.get(payload.request_id).is_some();
+        let sent_to_update_stream =
+            order_update_notice(&payload, data_owned).is_some_and(|notice| self.send_order_update_item(RoutedItem::Notice(notice)));
         match classify_error(payload) {
             ErrorDisposition::NoticeOnly(notice) => {
                 super::common::log_unrouted_notice(&notice);
@@ -432,7 +437,9 @@ impl<S: Stream> TcpMessageBus<S> {
     }
 
     fn process_response_with_id(&self, request_id: i32, message: ResponseMessage, routed: bool) {
-        if self.requests.contains(&request_id) {
+        if let Some(inbox) = self.bounded_requests.get(request_id) {
+            inbox.push(message.into());
+        } else if self.requests.contains(&request_id) {
             self.requests.send(&request_id, message.into()).unwrap();
         } else if self.orders.contains(&request_id) {
             self.orders.send(&request_id, message.into()).unwrap();
@@ -447,7 +454,9 @@ impl<S: Stream> TcpMessageBus<S> {
     /// Tries the request-channel first, falls back to the order-channel for
     /// notices/errors that arrive bound to an order_id.
     fn deliver_to_request_id(&self, request_id: i32, item: RoutedItem, sent_to_update_stream: bool) {
-        if self.requests.contains(&request_id) {
+        if let Some(inbox) = self.bounded_requests.get(request_id) {
+            inbox.push(item);
+        } else if self.requests.contains(&request_id) {
             let _ = self.requests.send(&request_id, item);
         } else if self.orders.contains(&request_id) {
             let _ = self.orders.send(&request_id, item);
@@ -637,6 +646,20 @@ impl<S: Stream> TcpMessageBus<S> {
 }
 
 impl<S: Stream> MessageBus for TcpMessageBus<S> {
+    fn send_bounded(&self, packet: &[u8]) -> Result<(), Error> {
+        self.connection.write_bounded(packet)
+    }
+    fn register_bounded(&self, request_id: i32, spec: super::bounded::RequestSpec) -> Result<super::bounded::BoundedRead, Error> {
+        if self.shutdown.is_requested() {
+            return Err(Error::Shutdown);
+        }
+        self.bounded_requests.register(request_id, spec)
+    }
+
+    fn request_shutdown_sync(&self) {
+        self.request_shutdown();
+    }
+
     fn send_request(&self, request_id: i32, message: &[u8]) -> Result<InternalSubscription, Error> {
         let (sender, receiver) = channel::unbounded();
         let sender_copy = sender.clone();
@@ -997,3 +1020,7 @@ mod tests;
 #[cfg(test)]
 #[path = "sync_submission_tests.rs"]
 mod submission_tests;
+
+#[cfg(test)]
+#[path = "sync_enumeration_tests.rs"]
+mod enumeration_tests;
