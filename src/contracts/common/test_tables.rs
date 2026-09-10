@@ -417,6 +417,16 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
 pub fn matching_symbols_test_cases() -> Vec<MatchingSymbolsTestCase> {
     vec![
         MatchingSymbolsTestCase {
+            name: "explicit empty response",
+            pattern: "NO_MATCH",
+            ordered_responses: vec![proto_response(
+                IncomingMessages::SymbolSamples,
+                symbol_samples().request_id(9000).encode_proto(),
+            )],
+            expected_request: "81|9000|NO_MATCH|",
+            expected_count: 0,
+        },
+        MatchingSymbolsTestCase {
             name: "single match",
             pattern: "AAPL",
             ordered_responses: vec![proto_response(

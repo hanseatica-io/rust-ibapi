@@ -6,15 +6,15 @@ use crate::Error;
 
 /// Fold a one-shot subscription's single response into a result.
 ///
-/// Private on purpose. The only callers are the two retrying helpers below, and
-/// that is what makes "every one-shot retries" true — reachable from a domain
-/// module, it is a ready-made way to hand-roll a one-shot without retry, which
-/// is the bug #741 removed.
+/// Private on purpose: domain modules use the request helpers rather than
+/// hand-rolling response/error handling. Convenience helpers retry on reset;
+/// an explicitly single-attempt public API uses `one_shot_by_request_id_once`
+/// so its caller can own retry admission and pacing.
 ///
 /// `Some(Err)` propagates the routed error — e.g. a request-less hard error
 /// fanned out to one-shot shared channels — instead of masking it as a
 /// default value (#694). A closed stream is `Error::UnexpectedEndOfStream`;
-/// the ten sites that want an empty collection instead say so with
+/// sites that want an empty collection instead say so with
 /// [`empty_on_end_of_stream`].
 ///
 /// `processor` therefore never sees an `IncomingMessages::Error` frame. The
@@ -172,13 +172,20 @@ mod sync_helpers {
         encoder: impl Fn(i32) -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        crate::common::retry::blocking::retry_on_connection_reset(|| {
-            let request_id = client.next_request_id();
-            let request = encoder(request_id)?;
-            let subscription = client.send_request(request_id, request)?;
+        crate::common::retry::blocking::retry_on_connection_reset(|| one_shot_by_request_id_once(client, &encoder, &processor))
+    }
 
-            super::fold_one_shot(subscription.next(), &processor)
-        })
+    /// One attempt on a request-id channel; the caller owns any paced retry.
+    pub fn one_shot_by_request_id_once<R>(
+        client: &Client,
+        encoder: impl FnOnce(i32) -> Result<Vec<u8>, Error>,
+        processor: impl FnOnce(&ResponseMessage) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let request_id = client.next_request_id();
+        let request = encoder(request_id)?;
+        let subscription = client.send_request(request_id, request)?;
+
+        super::fold_one_shot(subscription.next(), processor)
     }
 }
 
@@ -256,14 +263,20 @@ mod async_helpers {
         encoder: impl Fn(i32) -> Result<Vec<u8>, Error>,
         processor: impl Fn(&ResponseMessage) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        crate::common::retry::retry_on_connection_reset(|| async {
-            let request_id = client.next_request_id();
-            let request = encoder(request_id)?;
-            let mut subscription = client.send_request(request_id, request).await?;
+        crate::common::retry::retry_on_connection_reset(|| async { one_shot_by_request_id_once(client, &encoder, &processor).await }).await
+    }
 
-            super::fold_one_shot(subscription.next().await, &processor)
-        })
-        .await
+    /// One attempt on a request-id channel; the caller owns any paced retry.
+    pub async fn one_shot_by_request_id_once<R>(
+        client: &Client,
+        encoder: impl FnOnce(i32) -> Result<Vec<u8>, Error>,
+        processor: impl FnOnce(&ResponseMessage) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let request_id = client.next_request_id();
+        let request = encoder(request_id)?;
+        let mut subscription = client.send_request(request_id, request).await?;
+
+        super::fold_one_shot(subscription.next().await, processor)
     }
 }
 
