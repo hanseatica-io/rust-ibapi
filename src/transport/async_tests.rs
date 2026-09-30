@@ -1179,3 +1179,207 @@ async fn test_unknown_message_id_reaches_the_notice_stream() {
         notice.message
     );
 }
+
+/// Bound for a shutdown to reach a parked subscriber.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Starts the dispatcher over the bus and waits for its handle to be installed
+/// (a separate task installs it), so a shutdown request lands on a running
+/// loop rather than one that has not started.
+async fn start_dispatcher(bus: &Arc<AsyncTcpMessageBus<MemoryStream>>) {
+    bus.clone().process_messages(0, Duration::ZERO).expect("process_messages");
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
+    while bus.process_task.read().await.is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "process_task never installed");
+        tokio::task::yield_now().await;
+    }
+}
+
+/// `request_shutdown_sync` — what `Client::drop` runs, with no runtime to
+/// clear anything — must still end a subscriber parked on a request channel:
+/// the dispatcher exits on the latch and drops every sender, so `next()`
+/// resolves `None` instead of pinning the bus (and its socket) forever.
+#[tokio::test]
+async fn sync_shutdown_ends_a_parked_request_subscriber() {
+    let (_stream, bus, mut sub) = make_request_subscription(42).await;
+    start_dispatcher(&bus).await;
+    let parked = tokio::spawn(async move { sub.next().await.map(|item| item.is_ok()) });
+    tokio::task::yield_now().await;
+
+    bus.request_shutdown_sync();
+
+    let outcome = tokio::time::timeout(SHUTDOWN_DEADLINE, parked)
+        .await
+        .expect("the parked subscriber was never woken")
+        .expect("subscriber task panicked");
+    assert_eq!(outcome, None, "end of stream, not an item");
+    assert!(bus.request_channels.read().await.is_empty());
+    assert!(!bus.is_connected());
+}
+
+/// The same for an order subscriber, a shared-channel subscriber, the
+/// order-update stream's subscriber and the execution map's sender aliases
+/// (clones of order senders, which even the async shutdown used to leave
+/// behind): every registered sender goes, and every map is empty after.
+#[tokio::test]
+async fn sync_shutdown_ends_order_shared_and_execution_aliased_subscribers() {
+    let (_stream, bus, mut order) = make_order_subscription(7).await;
+    let mut shared = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
+    let mut order_updates = bus.create_order_update_subscription().await.unwrap();
+    {
+        let sender = bus.order_channels.read().await.get(&7).unwrap().clone();
+        bus.execution_channels.write().await.insert("exec-1".to_string(), sender);
+    }
+    assert!(bus.order_update_stream.read().await.is_some(), "the order-update sender is registered");
+    start_dispatcher(&bus).await;
+    let order_parked = tokio::spawn(async move { order.next().await.is_none() });
+    let shared_parked = tokio::spawn(async move { shared.next_routed().await.is_none() });
+    let updates_parked = tokio::spawn(async move { order_updates.next_routed().await.is_none() });
+    tokio::task::yield_now().await;
+
+    bus.request_shutdown_sync();
+
+    for (name, parked) in [("order", order_parked), ("shared", shared_parked), ("order-update", updates_parked)] {
+        let ended = tokio::time::timeout(SHUTDOWN_DEADLINE, parked)
+            .await
+            .unwrap_or_else(|_| panic!("the parked {name} subscriber was never woken"))
+            .expect("subscriber task panicked");
+        assert!(ended, "{name}: end of stream, not an item");
+    }
+    assert!(bus.order_channels.read().await.is_empty());
+    assert!(bus.execution_channels.read().await.is_empty(), "execution aliases dropped too");
+    assert!(bus.shared_channel_senders.read().await.is_empty());
+    assert!(bus.shared_channel_receivers.read().await.is_empty());
+    assert!(bus.order_update_stream.read().await.is_none());
+}
+
+/// The dispatcher's terminal cleanup after an async shutdown is a no-op, not
+/// a second teardown: `ensure_shutdown` still joins cleanly.
+#[tokio::test]
+async fn async_shutdown_then_dispatcher_exit_is_idempotent() {
+    let (_stream, bus, mut sub) = make_request_subscription(9).await;
+    start_dispatcher(&bus).await;
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    mb.ensure_shutdown().await;
+    assert!(tokio::time::timeout(SHUTDOWN_DEADLINE, sub.next()).await.expect("woken").is_none());
+    assert!(bus.request_channels.read().await.is_empty());
+}
+
+/// A shutdown frame from the peer ends the dispatcher through the routing
+/// path — the bus shuts down and a parked subscriber sees end of stream —
+/// without anyone calling shutdown on the client.
+#[tokio::test]
+async fn a_shutdown_frame_from_the_peer_ends_the_dispatcher_and_its_subscribers() {
+    let (stream, bus, mut sub) = make_request_subscription(11).await;
+    start_dispatcher(&bus).await;
+
+    stream.push_inbound(body(&(IncomingMessages::Shutdown as i32).to_string()));
+
+    let item = tokio::time::timeout(SHUTDOWN_DEADLINE, sub.next())
+        .await
+        .expect("the parked subscriber was never woken");
+    assert!(item.is_none(), "end of stream, not an item: {item:?}");
+    assert!(!bus.is_connected());
+    assert!(bus.request_channels.read().await.is_empty());
+}
+
+/// A bounded registration after shutdown is refused up front rather than
+/// registered on a bus that will never route to it.
+#[tokio::test]
+async fn register_bounded_after_shutdown_is_refused() {
+    let (_stream, bus) = make_bus();
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    mb.request_shutdown_sync();
+    let spec = crate::transport::bounded::RequestSpec {
+        data: IncomingMessages::ContractData,
+        end: IncomingMessages::ContractDataEnd,
+        limits: crate::transport::bounded::RawLimits {
+            frames: 1,
+            frame_bytes: 64,
+            total_bytes: 64,
+        },
+    };
+    assert!(matches!(mb.register_bounded(1, spec), Err(Error::Shutdown)));
+}
+
+/// The order router's fallback strategy — a message type with no strategy of
+/// its own — routes by the order id alone: to the registered channel when
+/// there is one, and logged rather than failed when there is none.
+#[tokio::test]
+async fn the_fallback_order_strategy_routes_by_order_id_alone() {
+    let (_stream, bus) = make_bus();
+    let mut sub = bus.send_order_request(7, vec![]).await.unwrap();
+    // No order type maps to the fallback, so a non-order type reaches it.
+    let message = ResponseMessage::from(&format!("{}\0", IncomingMessages::ContractData as i32));
+
+    bus.route_to_order_channel(7, message.clone()).await.unwrap();
+    assert!(matches!(next_routed(&mut sub).await, RoutedItem::Response(_)));
+
+    // Unroutable (no id, no channel): logged, not an error.
+    bus.route_to_order_channel(-1, message.clone()).await.unwrap();
+    bus.route_to_order_channel(8, message).await.unwrap();
+}
+
+/// An order update with no reader left is reported as not sent, so the
+/// caller can tell a delivered update from one that went nowhere.
+#[tokio::test]
+async fn an_order_update_without_a_reader_is_reported_not_sent() {
+    let (_stream, bus) = make_bus();
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    let reader = mb.create_order_update_subscription().await.unwrap();
+    let message = ResponseMessage::from(&format!("{}\0", IncomingMessages::OrderStatus as i32));
+    assert!(bus.send_order_update(&message).await, "delivered while a reader exists");
+
+    drop(reader);
+    assert!(!bus.send_order_update(&message).await, "no reader: reported, not sent");
+}
+
+/// Waits for the dispatcher task to finish, so what follows runs after its
+/// terminal cleanup rather than racing it.
+async fn wait_for_dispatcher_exit(bus: &Arc<AsyncTcpMessageBus<MemoryStream>>) {
+    let handle = bus.process_task.write().await.take().expect("dispatcher started");
+    tokio::time::timeout(SHUTDOWN_DEADLINE, handle)
+        .await
+        .expect("the dispatcher never exited")
+        .expect("dispatcher task panicked");
+}
+
+/// An order-update stream asked for after the dispatcher's terminal cleanup
+/// is refused: nothing is written on that path, so no write would refuse it,
+/// and a sender registered then has no dispatcher left to clear it — its
+/// reader would park forever, the bug the cleanup exists to end.
+#[tokio::test]
+async fn an_order_update_stream_after_shutdown_is_refused() {
+    let (_stream, bus) = make_bus();
+    start_dispatcher(&bus).await;
+    bus.request_shutdown_sync();
+    wait_for_dispatcher_exit(&bus).await;
+
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    assert!(matches!(mb.create_order_update_subscription().await, Err(Error::Shutdown)));
+    assert!(bus.order_update_stream.read().await.is_none(), "nothing registered");
+}
+
+/// A shared request after the dispatcher's cleanup reports the shutdown, as
+/// the refused write did before the cleanup removed the shared receivers —
+/// not a missing channel configuration. An unconfigured type on a live bus
+/// is still a configuration error.
+#[tokio::test]
+async fn a_shared_request_after_shutdown_reports_the_shutdown() {
+    let (_stream, bus) = make_bus();
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    assert!(matches!(
+        mb.send_shared_request(OutgoingMessages::RequestMarketData, vec![]).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    start_dispatcher(&bus).await;
+    bus.request_shutdown_sync();
+    wait_for_dispatcher_exit(&bus).await;
+
+    assert!(bus.shared_channel_receivers.read().await.is_empty(), "the cleanup ran");
+    assert!(matches!(
+        mb.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await,
+        Err(Error::Shutdown)
+    ));
+}

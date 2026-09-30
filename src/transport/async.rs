@@ -450,6 +450,13 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                     }
                 }
             }
+            // Every exit — the latched flag included, which `request_shutdown_sync`
+            // sets from `Client::drop` without a runtime to clear anything — ends
+            // here: with no dispatcher, a registered sender can never deliver
+            // again, so the senders are dropped and every parked subscriber
+            // sees end of stream instead of waiting forever while it keeps the
+            // bus and its socket alive. Idempotent after an async shutdown.
+            message_bus.close_channels().await;
         });
 
         // Store the task handle
@@ -522,36 +529,26 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         // Set the shutdown flag and mark as disconnected
         self.connected.store(false, Ordering::Relaxed);
         self.shutdown.request();
+        self.close_channels().await;
+    }
 
-        // Clear all channels - dropping the senders will close the channels
-        // and cause all receivers to get RecvError::Closed. This diverges
-        // from sync's shutdown, which sends Error::Shutdown before clearing:
-        // async consumers see end-of-stream, sync consumers see the error.
+    /// Drops every registered sender so every receiver sees end of stream.
+    ///
+    /// This diverges from sync's shutdown, which sends `Error::Shutdown`
+    /// before clearing: async consumers see end-of-stream, sync consumers
+    /// see the error. Every alias of a sender goes — the execution map holds
+    /// clones of order senders for commission routing, and a clone left there
+    /// would keep its channel open. Idempotent; the dispatcher runs it on
+    /// every exit, so a shutdown latched without a runtime still ends every
+    /// parked subscriber once the dispatcher sees the flag.
+    async fn close_channels(&self) {
         self.bounded_requests.close();
-        {
-            let mut channels = self.request_channels.write().await;
-            channels.clear();
-        }
-
-        {
-            let mut channels = self.order_channels.write().await;
-            channels.clear();
-        }
-
-        {
-            let mut channels = self.shared_channel_senders.write().await;
-            channels.clear();
-        }
-
-        {
-            let mut channels = self.shared_channel_receivers.write().await;
-            channels.clear();
-        }
-
-        {
-            let mut order_update_stream = self.order_update_stream.write().await;
-            *order_update_stream = None;
-        }
+        self.request_channels.write().await.clear();
+        self.order_channels.write().await.clear();
+        self.execution_channels.write().await.clear();
+        self.shared_channel_senders.write().await.clear();
+        self.shared_channel_receivers.write().await.clear();
+        *self.order_update_stream.write().await = None;
     }
 
     /// Route error message using routing decision
@@ -850,6 +847,11 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             let channels = self.shared_channel_receivers.read().await;
             if let Some(receiver) = channels.get(&message_type) {
                 receiver.resubscribe()
+            } else if self.shutdown.is_requested() {
+                // Only `close_channels` removes a shared receiver, and it runs
+                // after the latch: a missing one on a latched bus is the
+                // shutdown, not a configuration error.
+                return Err(Error::Shutdown);
             } else {
                 return Err(Error::InvalidArgument(format!(
                     "No shared channel configured for message type: {:?}",
@@ -899,6 +901,14 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
 
     async fn create_order_update_subscription(&self) -> Result<AsyncInternalSubscription, Error> {
         let mut order_update_stream = self.order_update_stream.write().await;
+
+        // Nothing is written here, so no write refuses on a latched bus. A
+        // stream registered after `close_channels` would have no dispatcher
+        // left to clear it and would park its reader forever; the check is
+        // under the lock `close_channels` takes, and the latch precedes it.
+        if self.shutdown.is_requested() {
+            return Err(Error::Shutdown);
+        }
 
         // A registration with no receivers is a dropped stream whose cleanup
         // signal has not been processed yet (see `remove_if_dead`); replace it

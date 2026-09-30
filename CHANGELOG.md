@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A shutdown latched without a runtime (`Client::drop` runs `request_shutdown_sync`) now ends every parked async subscriber: the dispatcher drops every registered sender on exit — request, order, shared, the order-update stream and the execution map's sender aliases, which even the async shutdown left behind — so `next()` resolves `None` instead of waiting forever while the subscription keeps the message bus and its socket alive. Observed downstream as a Gateway refusing a client id for as long as a dropped client's orphaned subscriber lived. A registration that arrives after that cleanup is refused with `Error::Shutdown`: the order-update stream, which writes nothing and so met no refusing write, would otherwise have parked its reader forever, and a shared request now reports the shutdown rather than a missing channel configuration.
+
+- Dropping an uncancelled async `Subscription` outside a Tokio runtime no longer panics (a panic in `Drop` aborts the process when it lands during an unwind or under `panic = "abort"`); without a runtime the cancel is not written, and the registration's own drop still cleans up locally.
+
 - A bounded query's partial or abandoned async write latches shutdown before releasing the connection write turn. Later/queued writes and reconnect handshakes check shutdown inside that turn, so they cannot append to an uncertain frame. Successful writes leave the session usable; legacy write-failure retry policy is unchanged.
 
 - Request and order registrations are now owned before submission writes begin, so write failures (both clients) and caller cancellation during an async write trigger local registration cleanup. Successful submissions transfer ownership to the returned subscription; stale cleanup still preserves a newer registration. This does not send a broker cancellation or make an interrupted wire write safe to reuse.

@@ -796,3 +796,40 @@ async fn test_collect_for_filters_notices() {
 
     assert_eq!(collected, vec![CollectItem(10), CollectItem(20)]);
 }
+
+/// A subscription with a cancel message, dropped on a plain thread — a struct
+/// holding one going out of scope after its runtime, or on a thread of its
+/// own — must not panic: `Drop` used to `tokio::spawn` the cancel write
+/// unconditionally, and a panic in `Drop` aborts the process when it lands
+/// during an unwind or under `panic = "abort"`. Without a runtime the cancel
+/// is simply not written.
+#[tokio::test]
+async fn dropping_an_uncancelled_subscription_outside_a_runtime_does_not_panic() {
+    #[derive(Debug)]
+    struct TestItem;
+
+    impl StreamDecoder<TestItem> for TestItem {
+        const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::TickPrice];
+
+        fn decode(_context: &DecoderContext, _msg: &ResponseMessage) -> Result<TestItem, Error> {
+            Ok(TestItem)
+        }
+
+        fn cancel_message(_server_version: i32, _id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
+            Ok(crate::messages::encode_protobuf_message(OutgoingMessages::CancelMarketData as i32, &[]))
+        }
+    }
+
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+    let subscription: Subscription<TestItem> =
+        Subscription::new_from_internal::<TestItem>(internal, message_bus.clone(), Some(9000), None, DecoderContext::default());
+    assert!(subscription.cancel_fn.is_some(), "the drop path under test writes a cancel");
+
+    // Off the runtime: a std thread has no tokio context.
+    std::thread::spawn(move || drop(subscription))
+        .join()
+        .expect("dropping a subscription outside a runtime panicked");
+    assert!(message_bus.request_messages().is_empty(), "no runtime, no cancel written");
+}

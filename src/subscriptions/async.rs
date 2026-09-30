@@ -479,11 +479,23 @@ impl<T> Drop for Subscription<T> {
 
             if let Ok(message) = cancel_fn(context.server_version, id, Some(&context)) {
                 // Drop can't be async; spawn the cancel send so it actually goes out.
-                tokio::spawn(async move {
-                    if let Err(e) = message_bus.send_message(message).await {
-                        warn!("error sending cancel message in drop: {e}");
+                // A subscription can be dropped from a plain thread (a struct
+                // holding one goes out of scope after its runtime, or on a
+                // thread of its own): `tokio::spawn` would panic there, and a
+                // panic in `Drop` aborts the process when it lands during an
+                // unwind or under `panic = "abort"`. Without a runtime there
+                // is no one to write the cancel; the registration's own drop
+                // still cleans up locally, and the session's close ends it.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.spawn(async move {
+                            if let Err(e) = message_bus.send_message(message).await {
+                                warn!("error sending cancel message in drop: {e}");
+                            }
+                        });
                     }
-                });
+                    Err(_) => debug!("subscription dropped outside a runtime; cancel not written"),
+                }
             }
         }
     }
